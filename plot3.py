@@ -83,7 +83,7 @@ def plot95_ddpg(output_dir, Benchmark_modes, runs, minindex, variable="reward", 
     axes[1].set_ylabel("% of tasks")
     axes[2].set_ylabel("% of UDs")
     plt.tight_layout()  # Ensure proper spacing between subplots
-    plt.savefig(f'{output_dir}/P3AtEval_s100+5_10.3.png')
+    plt.savefig(f'{output_dir}/P3AtEval_s50+5_10.3.png')
     plt.close()
 
 # Rest of the script remains unchanged
