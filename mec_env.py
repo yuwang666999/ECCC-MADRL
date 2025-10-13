@@ -1,46 +1,37 @@
 import numpy as np
 from copy import deepcopy
 
-# 根据论文更新参数
-LAMBDA_E = 0.5  # λ1 - 能耗权重系数
-LAMBDA_T = 0.5  # λ2 - 时间权重系数
-MIN_SIZE = 1  # z_n 最小值 (MB)
-MAX_SIZE = 50  # z_n 最大值 (MB)
-MAX_CYCLE = 737.5  # C_n 最大值 (cycles/bit)
-MIN_CYCLE = 300  # C_n 最小值 (cycles/bit)
-MIN_DDL = 0.1  # T_n 最小值 (seconds)
-MAX_DDL = 0.9  # T_n 最大值 (seconds) - 论文中为[0.1, 0.9]
-MIN_RES = 0.4  # f_n,min (GHz)
-MAX_RES = 1.5  # f_n,max 最大值 (GHz)
-MAX_POWER = 24  # P_n,max 最大值 (dBm)
-MIN_POWER = 1  # P_n,min 最小值 (dBm)
-K_ENERGY_LOCAL = 5e-27  # k_local 本地能耗系数 (MJ)
-K_ENERGY_SERVER = 8e-27  # k_server 服务器能耗系数 (MJ)
-MAX_ENE = 3.2  # b_n,max 电池容量最大值 (MJ)
-MIN_ENE = 0.5  # b_n,min 电池容量最小值 (MJ)
-# 能量收集参数
-HARVEST_MIN = 0.0005  # e_n(t) 最小值 (MJ)
-HARVEST_MAX = 0.0015  # e_n(t) 最大值 (MJ)
-SELF_DISCHARGE_RATE = 0.005  # 电池自放电率
-MAX_GAIN = 14  # g_{n,m} 最大值 (dB)
-MIN_GAIN = 5  # g_{n,m} 最小值 (dB)
-W_BANDWIDTH = 40  # B_total 基站总带宽 (MHz)
-ETA_MAX = 0.05  # η_{n,max} 能量-时间权衡系数阈值 (MJ/s)
+# 基础参数保持不变
+LAMBDA_E = 0.5
+LAMBDA_T = 0.5
+MIN_SIZE = 1  # MB*1024*8
+MAX_SIZE = 50  # MB*1024*8 #bits
+MAX_CYCLE = 737.5  # cycles as in reference
+MIN_CYCLE = 300  # cycles (customized)
+MIN_DDL = 0.1  # seconds
+MAX_DDL = 1  # seconds
+MIN_RES = 0.4  # GHz*10**9 #cycles per second
+MAX_RES = 1.5  # GHz*10**9 #cycles per second
+MAX_POWER = 24  # 10**(24/10) # 24 dBm converting 24 dB to watt(j/s)
+MIN_POWER = 1  # 10**(1/10) # converting 1 dBm to watt(j/s)
+K_ENERGY_LOCAL = 5 * 1e-27  # no conversion
+MAX_ENE = 3.2  # MJ*10**6 # in joules
+MIN_ENE = 0.5  # MJ*10**6 # in joules
+HARVEST_RATE = 0.001  # in joules
+MAX_GAIN = 14  # dB
+MIN_GAIN = 5  # dB
+W_BANDWIDTH = 40  # MHZ
 
-# 根据论文Table 2更新多服务器参数
-N_SERVERS = 3  # M = 3 (1个核心, 2个轻量)
-# 核心服务器: K_m=15, 轻量服务器: K_m=10
-K_CHANNELS = [15, 10, 10]  # 每个服务器的子信道数
-# 核心服务器: Z_m^e=800MB, 轻量服务器: Z_m^e=400MB
-S_ES = [800, 400, 400]  # 每个服务器的存储容量(MB)
-# 核心服务器: U_m=16, 轻量服务器: U_m=8
-N_UNITS = [16, 8, 8]  # 每个服务器的处理单元数
-# 核心服务器: f_m^cpu=6GHz, 轻量服务器: f_m^cpu=4GHz
-CAPABILITY_ES = [6, 4, 4]  # 每个服务器的计算能力(GHz)
+# 多服务器参数
+N_SERVERS = 3  # 服务器数量
+K_CHANNELS = [10, 8, 12]  # 每个服务器的信道数
+S_ES = [400, 300, 500]  # 每个服务器的存储容量(MB*1024*8)
+N_UNITS = [8, 6, 10]  # 每个服务器的处理单元数
+CAPABILITY_ES = [4, 3.5, 5]  # 每个服务器的计算能力(GHz*10^9)
 
 ENV_MODE = "H2"  # ["H2", "TOBM"]
-# MAX_STEPS = 10
-MAX_STEPS = 30
+MAX_STEPS = 10
+
 
 class MecEnv(object):
     def __init__(self, n_agents, env_seed=None):
@@ -76,8 +67,6 @@ class MecEnv(object):
         # 服务器状态 (每个服务器的当前负载)
         self.server_loads = np.zeros(N_SERVERS)
         self.server_storage = [s * 1024 * 8 for s in S_ES]  # 转换为bits
-        # 每个设备的最大电量 b_n,max（式11）
-        self.B_max = np.zeros(self.n_agents)
 
     def reset_mec(self, eval_env_seed=None):
         if eval_env_seed is not None:
@@ -89,7 +78,6 @@ class MecEnv(object):
             self.S_cycle[n] = np.random.uniform(MIN_CYCLE, MAX_CYCLE)
             self.S_ddl[n] = np.random.uniform(MIN_DDL, MAX_DDL - MAX_DDL / 10)
             self.S_energy[n] = deepcopy(self.Initial_energy[n])
-            self.B_max[n] = np.random.uniform(MIN_ENE, MAX_ENE)
 
         self.S_energy = np.clip(self.S_energy, MIN_ENE, MAX_ENE)
         self.server_loads = np.zeros(N_SERVERS)  # 重置服务器负载
@@ -212,47 +200,27 @@ class MecEnv(object):
             else:  # 服务器执行
                 Energy_n[n] = Energy_off[n]
 
-        # 更新电池电量 b_n(t+1)（式11）：
-        # b_{t+1} = clip_{[b_min, b_max]}( b_t*(1-0.005) - E_n(MJ) + e_n )
-        E_MJ = Energy_n * 1e-6
-        harvest = np.random.uniform(HARVEST_MIN, HARVEST_MAX, size=self.n_agents)
-        b_next = self.S_energy * (1 - SELF_DISCHARGE_RATE) - E_MJ + harvest
-        # 先按各自 b_max 上界截断，再保证不低于 b_min
-        b_next = np.minimum(b_next, self.B_max)
-        b_next = np.maximum(b_next, MIN_ENE)
-        self.S_energy = b_next
+        # 更新能量状态 (考虑能量收集)
+        self.S_energy = np.clip(
+            self.S_energy - Energy_n * 1e-6 + np.random.normal(HARVEST_RATE, 0, size=self.n_agents) * 1e-6,
+            0, MAX_ENE
+        )
 
-        # 统计违反次数（用于可视化）
-        ddl_violations = (np.array(Time_finish) > self.S_ddl).astype(np.float32)
-        battery_violations = (self.S_energy < MIN_ENE + 1e-9).astype(np.float32)
-        time_penalty_nonzero_count = float(np.sum(ddl_violations)) / self.n_agents
-        energy_penalty_nonzero_count = float(np.sum(battery_violations)) / self.n_agents
-
-        # 能量-时间权衡系数 η_n（式13）
-        # η = E(MJ) / t(s)
-        eta = np.zeros(self.n_agents)
+        # 能量耗尽惩罚
         for i in range(self.n_agents):
-            eta[i] = E_MJ[i] / max(Time_finish[i], 1e-9)
+            if self.S_energy[i] <= 0:
+                Time_n[i] = MAX_DDL / MAX_DDL
 
-        # 奖励函数（式15）：R = - (λ1 E_n(t) + λ2 t_n(t)) + r_penalty
-        base_cost = LAMBDA_E * E_MJ + LAMBDA_T * np.array(Time_n)
-        r_penalty = np.zeros(self.n_agents)
-        
-        # 约束违反惩罚（根据论文）
-        # 如果 b_n(t+1) < b_n,min: r_penalty = -50
-        r_penalty[self.S_energy <= MIN_ENE + 1e-9] += -50.0
-        
-        # 如果 t_n(t) > T_n: r_penalty = -100
-        r_penalty[np.array(Time_finish) > self.S_ddl] += -100.0
-        
-        # 如果 η_n > η_n,max: r_penalty = -(η_n - η_n,max) × 10
-        eta_excess = np.maximum(eta - ETA_MAX, 0.0)
-        r_penalty += -10.0 * eta_excess
-        
-        # 如果无约束违反: r_penalty = 0 (已经初始化为0)
+        # 计算惩罚项
+        Time_penalty = np.maximum((Time_n - self.S_ddl / MAX_DDL), 0)
+        Energy_penalty = np.maximum((MIN_ENE - self.S_energy), 0) * 10 ** 6
 
-        Reward = -base_cost + r_penalty
-        # 与原实现保持一致：各体奖励设为总和
+        time_penalty_nonzero_count = np.count_nonzero(Time_penalty) / self.n_agents
+        energy_penalty_nonzero_count = np.count_nonzero(Energy_penalty) / self.n_agents
+
+        # 计算奖励
+        Reward = -1 * (LAMBDA_E * np.array(Energy_n) + LAMBDA_T * np.array(Time_n)) \
+                 - 1 * (LAMBDA_E * np.array(Energy_penalty) + LAMBDA_T * np.array(Time_penalty))
         Reward = np.ones_like(Reward) * np.sum(Reward)
 
         # 更新服务器负载 (用于下一状态)

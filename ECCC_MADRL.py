@@ -9,7 +9,7 @@ from copy import deepcopy
 from numpy import savetxt
 from numpy import loadtxt
 
-from mec_env import N_SERVERS, K_CHANNELS, S_ES, CAPABILITY_ES
+from mec_env import N_SERVERS, K_CHANNELS, S_ES
 from utils import to_tensor_var
 from Model import ActorNetwork, CriticNetwork
 from prioritized_memory import Memory
@@ -19,10 +19,10 @@ from mec_env import ENV_MODE, N_UNITS
 class ECCC_MADDPG(object):
     def __init__(self, InfdexofResult, env, env_eval, n_agents, state_dim, action_dim, action_lower_bound,
                  action_higher_bound,
-                 memory_capacity=10000, target_tau=0.001, reward_gamma=0.99, reward_scale=0.01, done_penalty=None,#reward_scale=1.
+                 memory_capacity=10000, target_tau=1, reward_gamma=0.99, reward_scale=1., done_penalty=None,
                  actor_output_activation=torch.tanh, actor_lr=0.0001, critic_lr=0.001,
                  optimizer_type="adam", max_grad_norm=None, batch_size=64, episodes_before_train=64,
-                 epsilon_start=0.9, epsilon_end=0.1, epsilon_decay=None, use_cuda=False):
+                 epsilon_start=1, epsilon_end=0.01, epsilon_decay=None, use_cuda=False):
         self.n_agents = n_agents
         self.env = env
         self.env_eval = env_eval
@@ -61,10 +61,7 @@ class ECCC_MADDPG(object):
 
         self.target_tau = target_tau
 
-        # 客户端代理网络 - 每个设备一个
         self.actors = [ActorNetwork(self.state_dim, self.action_dim, self.actor_output_activation)] * self.n_agents
-        
-        # 主控代理网络 - 全局Critic
         critic_state_dim = self.n_agents * self.state_dim
         critic_action_dim = self.n_agents * self.action_dim
         self.critics = [CriticNetwork(critic_state_dim, critic_action_dim, self.state_dim, self.action_dim)] * 1
@@ -448,45 +445,17 @@ class ECCC_MADDPG(object):
             if server_choice > 0:  # 选择了某个服务器
                 server_requests[server_choice - 1].append(agent_id)
 
-        # 处理每个服务器的任务分配（实现论文公式21的Match_n,m）
+        # 处理每个服务器的任务分配
         for s in range(N_SERVERS):
             if len(server_requests[s]) == 0:
                 continue
 
-            # 计算每个候选任务在该服务器的匹配度分数（公式21）
-            # Match_n,m = α*(1/(1+|z_n-z_m^e|/2)) + β*(1/(1+|c_n-U_m^cpu*T|)) + γ*(1/(1+|η_n-η_m,opt|))
-            alpha, beta, gamma = 0.4, 0.4, 0.2  # 论文中的匹配权重
-            match_scores = {}
-            
-            # 服务器最优权衡系数
-            eta_m_opt = 0.06 if s == 0 else 0.04  # 核心服务器0.06，轻量服务器0.04
-            
-            for agent_id in server_requests[s]:
-                z_n = state[agent_id, 3]  # 任务大小
-                c_n = state[agent_id, 4]  # 任务计算需求
-                local_res = state[agent_id, 6]  # 本地计算资源
-                
-                # 存储匹配项：1/(1+|z_n-z_m^e|/2)
-                storage_term = 1.0 / (1.0 + abs(z_n - S_ES[s]) / 2.0)
-                
-                # 计算能力匹配项：1/(1+|c_n-U_m^cpu*T|)
-                # 这里简化为本地资源与服务器能力的匹配
-                compute_term = 1.0 / (1.0 + abs(local_res - CAPABILITY_ES[s]))
-                
-                # 权衡系数匹配项：1/(1+|η_n-η_m,opt|)
-                # 这里使用任务大小和截止时间的比值作为η_n的近似
-                eta_n = z_n / (state[agent_id, 5] + 1e-9)  # 简化的η_n计算
-                tradeoff_term = 1.0 / (1.0 + abs(eta_n - eta_m_opt))
-                
-                # 综合匹配分数
-                match_scores[agent_id] = alpha * storage_term + beta * compute_term + gamma * tradeoff_term
-
-            # 检查是否超过约束（信道/处理单元或存储）
+            # 检查是否超过约束
             if len(server_requests[s]) > constraints[s] or \
                     np.sum(state[server_requests[s], 3]) > S_ES[s]:
 
                 if not evaluation and (np.random.rand() <= epsilon):  # 探索
-                    # 随机选择满足约束的任务（约束内化设计）
+                    # 随机选择满足约束的任务
                     agent_list = deepcopy(server_requests[s])
                     random.shuffle(agent_list)
                     selected = []
@@ -500,44 +469,30 @@ class ECCC_MADDPG(object):
                     for agent_id in server_requests[s]:
                         critic_action[agent_id] = 1 if agent_id in selected else 0
                 else:
-                    # Per-action DQN决策机制：为每个任务请求独立生成Q值
+                    # 基于Q值选择最佳任务
+                    critic_action_Qs = np.zeros((self.n_agents))
+                    critic_action_Qs.fill(-np.inf)
+
                     states_var = to_tensor_var(state, self.use_cuda).view(-1, self.n_agents, self.state_dim)
                     whole_states_var = states_var.view(-1, self.n_agents * self.state_dim)
                     actor_action_var = to_tensor_var(actor_action, self.use_cuda).view(-1, self.n_agents,
                                                                                        self.action_dim)
                     whole_actions_var = actor_action_var.view(-1, self.n_agents * self.action_dim)
 
-                    # 计算每个请求的Q值（Per-action DQN）
-                    raw_qs = []
                     for agent_id in server_requests[s]:
-                        qv = self.critics[0](
+                        critic_action_Qs[agent_id] = self.critics[0](
                             whole_states_var.squeeze(),
                             whole_actions_var.squeeze(),
                             states_var[0, agent_id, :],
                             actor_action_var[0, agent_id, :]
-                        ).detach().cpu().numpy()
-                        raw_qs.append(qv)
-                    raw_qs = np.array(raw_qs).astype(np.float32)
-                    
-                    # 归一化Q值到[-10, 10]范围
-                    if raw_qs.size == 0:
-                        norm_qs = np.zeros(0)
-                    else:
-                        q_min, q_max = np.min(raw_qs), np.max(raw_qs)
-                        norm_qs = (raw_qs - q_min) / (q_max - q_min + 1e-9) * 20 - 10  # 映射到[-10,10]
+                        ).detach()
 
-                    # 综合Q值与匹配度得分
-                    combined = []
-                    for k, agent_id in enumerate(server_requests[s]):
-                        q_part = norm_qs[k] if norm_qs.size > 0 else 0.0
-                        # 论文中Q值与匹配度的综合
-                        combined.append((agent_id, 0.5 * q_part + 0.5 * match_scores[agent_id]))
-
-                    # 按组合得分排序并选择
-                    sorted_pairs = sorted(combined, key=lambda x: x[1], reverse=True)
+                    # 按Q值排序并选择
+                    sorted_indices = np.argsort(critic_action_Qs[server_requests[s]])[::-1]
                     selected = []
                     total_size = 0
-                    for agent_id, _ in sorted_pairs:
+                    for idx in sorted_indices:
+                        agent_id = server_requests[s][idx]
                         if len(selected) < constraints[s] and \
                                 total_size + state[agent_id, 3] <= S_ES[s]:
                             selected.append(agent_id)
@@ -546,22 +501,9 @@ class ECCC_MADDPG(object):
                         else:
                             critic_action[agent_id] = 0
             else:
-                # 未超过并且仍需考虑存储：若总大小超过存储则按 Match 选取
-                total_size = np.sum(state[server_requests[s], 3])
-                if total_size <= S_ES[s]:
-                    for agent_id in server_requests[s]:
-                        critic_action[agent_id] = 1
-                else:
-                    sorted_by_match = sorted(server_requests[s], key=lambda aid: match_scores[aid], reverse=True)
-                    selected = []
-                    acc = 0
-                    for agent_id in sorted_by_match:
-                        if len(selected) < constraints[s] and acc + state[agent_id, 3] <= S_ES[s]:
-                            selected.append(agent_id)
-                            acc += state[agent_id, 3]
-                            critic_action[agent_id] = 1
-                        else:
-                            critic_action[agent_id] = 0
+                # 未超过约束，全部接受
+                for agent_id in server_requests[s]:
+                    critic_action[agent_id] = 1
 
         # 构建最终混合动作
         for n in range(self.n_agents):
@@ -666,10 +608,10 @@ class ECCC_MADDPG(object):
                 arrayserver = np.array(self.serverconstraints)
                 arrayenergy = np.array(self.energyconstraints)
                 arraytime = np.array(self.timeconstraints)
-                savetxt('./CSV/results/ECCC-MADRL' + str(self.InfdexofResult) + '.csv', arrayresults)
-                savetxt('./CSV/Server_constraints/ECCC-MADRL' + str(self.InfdexofResult) + '.csv', arrayserver)
-                savetxt('./CSV/Energy_constraints/ECCC-MADRL' + str(self.InfdexofResult) + '.csv', arrayenergy)
-                savetxt('./CSV/Time_constraints/ECCC-MADRL' + str(self.InfdexofResult) + '.csv', arraytime)
+                savetxt('./CSV/results/ECCC_MADRL' + str(self.InfdexofResult) + '.csv', arrayresults)
+                savetxt('./CSV/Server_constraints/ECCC_MADRL' + str(self.InfdexofResult) + '.csv', arrayserver)
+                savetxt('./CSV/Energy_constraints/ECCC_MADRL' + str(self.InfdexofResult) + '.csv', arrayenergy)
+                savetxt('./CSV/Time_constraints/ECCC_MADRL' + str(self.InfdexofResult) + '.csv', arraytime)
                 print("Episode:", self.n_episodes, "Episodic Energy:  Min mean Max : ", np.min(arrayenergy),
                       mean_energyconstraint, np.max(arrayenergy))
                 print(f"[评估完成] 耗时 {time.time() - start_time:.2f}秒")  # 新增
@@ -682,5 +624,5 @@ class ECCC_MADDPG(object):
         self.Training_episodes.append(self.n_episodes + 1)
         self.Training_results.append(mean_reward)
         arrayresults = np.array(self.Training_results)
-        savetxt('./CSV/AtTraining/ECCC-MADRL' + self.InfdexofResult + '.csv', arrayresults)
+        savetxt('./CSV/AtTraining/ECCC_MADRL' + self.InfdexofResult + '.csv', arrayresults)
         # print("Episode:", self.n_episodes, "Episodic Reward:  Min mean Max : ", np.min(arrayresults), mean_reward, np.max(arrayresults))
